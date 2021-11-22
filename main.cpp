@@ -295,13 +295,11 @@ void controller(VideoCapture &cam, atomic<bool> &done, ThreadSafeQueue<Mat> &fra
 
   unsigned int frame_idx = 0;
 
-  bool t1_take = false;
-
   while (!done) {
     // get new frame
     cam >> frame;
 
-    // if empty frame was pulled, skip it
+    // if empty frame was pulled, skip it (rare, but possible)
     if (frame.empty())
       continue;
 
@@ -363,6 +361,7 @@ int main() {
     int c = waitKey(1);
     if (c == 27) {
       done = true;
+      break;
     }
   }
 
@@ -370,6 +369,8 @@ int main() {
   cout << "Stopping capture and closing out all windows..." << endl;
   cam.release();
   destroyAllWindows();
+
+  cout << controller_.joinable() << " | " << t1.joinable() << " | " << t2.joinable() << endl;
 
   // join all threads
   controller_.join();
