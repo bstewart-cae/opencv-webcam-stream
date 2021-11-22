@@ -1,65 +1,366 @@
 #include "opencv2/opencv.hpp"
+#include <stdexcept>
+#include <iostream>
 #include <thread>
+#include <queue>
+#include <mutex>
+#include <atomic>
 
 using namespace cv;
 using namespace std;
+using namespace std::chrono_literals;
+
+const string T1_WINDOW_NAME = "t1 window";
+const string T2_WINDOW_NAME = "t2 window";
+
+/* START Overhead dependencies and utilities */
+/**
+ * A thread-safe queue
+ * @tparam T
+ */
+template<class T>
+class ThreadSafeQueue {
+private:
+    queue<T> queue_;
+    mutable mutex mutex_;
+    condition_variable cond_;
+public:
+    ThreadSafeQueue()
+            : queue_(), mutex_(), cond_() {}
+
+    ~ThreadSafeQueue() = default;
+
+    /**
+     * Get the current size of the queue
+     */
+    unsigned long size() {
+      unique_lock<mutex> lock(mutex_);
+      unsigned long size = queue_.size();
+      lock.unlock();
+      cond_.notify_one();
+      return size;
+    }
+
+    /**
+     * Add an element to the queue
+     */
+    void enqueue(T elem) {
+      lock_guard<mutex> lock(mutex_);
+      queue_.push(elem);
+      cond_.notify_one();
+    }
+
+    /**
+     * Grab the element at the front of the queue, otherwise, wait until
+     * an element becomes available
+     * @return
+     */
+    T dequeue() {
+      unique_lock<mutex> lock(mutex_);
+
+      // release lock to grab it again once waiting period is up
+      cond_.wait(lock, [&] {
+          return !queue_.empty();
+      });
+
+      T val = queue_.front();
+      queue_.pop();
+      return val;
+    }
+
+    /**
+     * Without extracting or returning item at front of the queue, remove it from the queue
+     * if the queue isn't empty (single-shot)
+     */
+    void pop() {
+      lock_guard<mutex> lock(mutex_);
+      if (!queue_.empty())
+        queue_.pop();
+    }
+
+    /**
+     * Grab front element of queue without removing it from the queue
+     * @return
+     */
+    T front() {
+      unique_lock<mutex> lock(mutex_);
+
+      // release lock to grab it again once waiting period is up
+      cond_.wait(lock, [&] {
+          return !queue_.empty();
+      });
+
+      T val = queue_.front();
+      return val;
+    }
+};
 
 /**
  * Convert HSV Mat object to BGR
  * @param inputImage
+ * @param fullImageBGR value passed by-reference
  * @return
  */
-Mat hsv2bgr(const Mat &inputImage) {
-  Mat fullImageRGB;
-  cvtColor(inputImage, fullImageRGB, COLOR_HSV2BGR);
-  return fullImageRGB;
+void hsv2bgr(const Mat &inputImage, Mat &fullImageBGR) {
+  cvtColor(inputImage, fullImageBGR, COLOR_HSV2BGR);
 }
 
 /**
  * Convert BGR Mat object to HSV
  * @param inputImage
+ * @param fullImageHSV value passed by-reference
  * @return
  */
-Mat bgr2hsv(const Mat &inputImage) {
-  Mat fullImageHSV;
+void bgr2hsv(const Mat &inputImage, Mat &fullImageHSV) {
   cvtColor(inputImage, fullImageHSV, COLOR_BGR2HSV);
-  return fullImageHSV;
 }
 
-void process_frame_mode_0(const queue<Mat> &frame_queue) {
-  while (true) {
-    size_t num_frames_in_queue = frame_queue.size();
+/**
+ * Pull out grayscale information from HSV image
+ * @param inputImage
+ * @param fullImageGray
+ */
+void hsv2gray(const Mat &inputImage, Mat &fullImageGray) {
+  Mat hsv_channels[3];
+  cv::split(inputImage, hsv_channels);
+  fullImageGray = hsv_channels[2];
+}
 
+/**
+ * Rotate image
+ * @param frame Mat object which represents pre-rotated image
+ * @param output Mat object to update as rotated image
+ * @param angle positive (counterclockwise), negative (clockwise) angle to rotate image based upon
+ */
+void rotate_image(const Mat &frame, Mat &output, double angle) {
+  // obtain the rotation matrix in order to rotate image around the pixel center
+  Point2f center(float((frame.cols - 1) / 2.0), float((frame.rows - 1) / 2.0));
+  Mat rotMatrix = getRotationMatrix2D(center, angle, 1.0);
+  Rect2f bbox = cv::RotatedRect(cv::Point2f(), frame.size(), float(angle)).boundingRect2f();
+
+  // adjust the transformation matrix
+  rotMatrix.at<double>(0, 2) += bbox.width / 2.0 - frame.cols / 2.0;
+  rotMatrix.at<double>(1, 2) += bbox.height / 2.0 - frame.rows / 2.0;
+
+  warpAffine(frame, output, rotMatrix, bbox.size());
+}
+
+/* END Overhead dependencies and utilities */
+
+void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done,
+                          const string &windowName) {
+  Mat new_frame, grayscale_frame;
+  unsigned int num_frames_pushed = 0;
+  double image_angle = 0;
+
+  while (!done) {
+    // check if the queue is as full as we want it (10 frames)
+    if (frame_queue.size() < 10) {
+      // remove and grab frame reference off of the queue
+      new_frame = frame_queue.dequeue();
+    } else {
+      // skip oldest frame and continue on since we are trying to operate above 10 frames in the queue
+      frame_queue.pop();
+      continue;
+    }
+
+//    imwrite("/Users/spencer/Desktop/t1_frame_" + to_string(num_frames_pushed + 1) + ".png", new_frame);
+
+    num_frames_pushed++;
+
+    if (num_frames_pushed % 5 == 0) {
+      // rotate image 90 degrees clockwise
+      image_angle -= 90;
+      // if rotation update is back to 360, update image angle to 0 to indicate no rotation needed
+      if (image_angle == -360)
+        image_angle = 0;
+    }
+
+    // pull out grasycale channel from HSV
+    hsv2gray(new_frame, grayscale_frame);
+
+    // when needing to displayed rotated image, rotate the image to be displayed
+    if (image_angle < 0) {
+      rotate_image(grayscale_frame, grayscale_frame, image_angle);
+    }
+
+    // queue display of frame
+    display_queue.enqueue(grayscale_frame);
   }
 }
 
-void process_frame_mode_1(const queue<Mat> &frame_queue) {
-  while (true) {
-    size_t num_frames_in_queue = frame_queue.size();
+void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done,
+                          const string &windowName) {
+  Mat hsv_frame, grayscale_frame, bgr_frame, mirrored, left_half, hist;
 
+  while (!done) {
+    // check if the queue has 1 frame to process
+    unsigned long queue_size = frame_queue.size();
+    if (queue_size != 1) {
+      if (queue_size > 1) {
+        cout
+                << "Something likely went wrong... There shouldn't be more than one frame queued at a time. Current size is: "
+                << queue_size << endl;
+      }
+      continue;
+    }
+
+    // peek and grab current (oldest) frame in queue (the only at this point), but don't remove it yet
+    hsv_frame = frame_queue.front();
+
+    int vbins = 32;
+    int histSize[] = {vbins};
+
+    float vranges[] = {0, 256};
+    const float *ranges[] = {vranges};
+
+    int channels[] = {2};
+
+    left_half = hsv_frame(Rect(0, 0, hsv_frame.cols / 2, hsv_frame.rows));
+
+    calcHist(&left_half, 1, channels, Mat(), hist, 1, histSize, ranges, true, false);
+
+    Scalar tempVal = mean(hist);
+
+    float sum_of_bin_medians = 0;
+    float total_freq = 0;
+    int step_size = int (vranges[1] - 1) / histSize[0];
+    for (int i=0; i<histSize[0]; i++) {
+      float freq = hist.at<float>(i, 0);
+      float midpoint = float ((i+1) * step_size - i * step_size) / 2;
+      total_freq += freq;
+      sum_of_bin_medians += midpoint * freq;
+    }
+
+    // take the mean of all histogram values, divide that by the number of bins, and then by the histogram step size
+    auto mean_pixel_intensity = sum_of_bin_medians / total_freq;
+    cout << "Mean pixel intensity: " << mean_pixel_intensity << endl;
+
+    // get original image
+    hsv2bgr(hsv_frame, bgr_frame);
+
+    // now that we are done processing, remove the item from the queue
+    // so other thread users of thread-safe queue can appropriately check the size before inserting a new frame
+    frame_queue.pop();
+
+    // max pixel intensity is 255, check if mean pixel intensity is > half of that
+    if (mean_pixel_intensity > 127.5) {
+      mirrored = Mat(bgr_frame.rows, bgr_frame.cols, CV_8UC3);
+      flip(bgr_frame, mirrored, 1);
+
+      // queue display of mirrored frame
+      display_queue.enqueue(mirrored);
+    } else {
+      // queue display of original frame
+      display_queue.enqueue(bgr_frame);
+    }
+  }
+}
+
+/**
+ * Controller thread function which manages frame distribution for processing
+ * @param cam
+ * @param done
+ * @param frame_queue_0
+ * @param frame_queue_1
+ */
+void controller(VideoCapture &cam, atomic<bool> &done, ThreadSafeQueue<Mat> &frame_queue_0,
+                ThreadSafeQueue<Mat> &frame_queue_1) {
+  Mat frame, hsv_frame;
+
+  unsigned int frame_idx = 0;
+
+  bool t1_take = false;
+
+  while (!done) {
+    // get new frame
+    cam >> frame;
+
+    // convert BGR frame to HSV
+    bgr2hsv(frame, hsv_frame);
+
+//    imwrite("/Users/spencer/Desktop/frame_" + to_string(frame_idx) + ".png", frame);
+
+    // For t1:
+    // since frame index is zero-based, push every 2nd frame to t1 by checking for an odd index
+    if (frame_idx % 2 != 0) {
+      frame_queue_0.enqueue(hsv_frame);
+      t1_take = true;
+    } else {
+      t1_take = false;
+    }
+
+    // For t2:
+    // push frame to t2 via 'frame_queue_1' only as close to every 1 second as possible
+    // ONLY push frame once queue is empty but use size() method since empty/pop conflict is inevitable
+    // and this needs to be a non-blocking check
+    if (frame_queue_1.size() == 0) {
+      // conditionally use copy of HSV frame to avoid concurrent memory access/manipulation
+      if (t1_take) {
+        Mat hsv_frame_copy = hsv_frame.clone();
+        frame_queue_1.enqueue(hsv_frame_copy);
+      } else {
+        frame_queue_1.enqueue(hsv_frame);
+      }
+    }
+
+    // increment frame index
+    frame_idx++;
   }
 }
 
 
 int main() {
-  cv::VideoCapture cam(0);
+  VideoCapture cam(0);
 
   if (!cam.isOpened()) {
-    throw std::runtime_error("Error");
+    throw runtime_error("Could not properly begin video capture");
   }
 
-  cv::namedWindow("Window");
-  cv::Mat output(350,350,CV_8UC1);
-  cv::Mat rgb_output(350,350,CV_8UC3);
+  // declare Mat frame queues for each of the 2 window-dedicated threads
+  ThreadSafeQueue<Mat> frame_queue_0, frame_queue_1;
 
-//  while(true){
-  cv::Mat frame;
-  cam>>frame;
-  cv::resize(frame, frame, cv::Size(350, 350));
+  // declare Mat display queues for each of the 2 window-dedicated threads
+  ThreadSafeQueue<Mat> display_queue_0, display_queue_1;
 
-  cv::imshow("bgr_frame", frame);
-  std::queue<Mat> frame_queue;
-  std::thread t1(process_frame_mode_0, frame_queue);
-  std::thread t2(process_frame_mode_1, frame_queue);
-  cout << "Doing things with webcam frames..." << endl;
+  // define atomic flag to indicate key press to stop capture, frame feeding and displaying
+  atomic<bool> done(false);
+
+  // initialize named windows for t1 and t2 outputs
+  namedWindow(T1_WINDOW_NAME, WINDOW_AUTOSIZE);
+  namedWindow(T2_WINDOW_NAME, WINDOW_AUTOSIZE);
+
+  std::thread controller_(controller, ref(cam), ref(done), ref(frame_queue_0), ref(frame_queue_1));
+
+  std::thread t1(process_frame_mode_0, ref(frame_queue_0), ref(display_queue_0), ref(done), T1_WINDOW_NAME);
+  std::thread t2(process_frame_mode_1, ref(frame_queue_1), ref(display_queue_1), ref(done), T2_WINDOW_NAME);
+
+  Mat frame_to_display_0, frame_to_display_1;
+
+  while (!done) {
+    // handle window display updates
+    frame_to_display_0 = display_queue_0.dequeue();
+    frame_to_display_1 = display_queue_1.dequeue();
+
+    // update display windows
+    imshow(T1_WINDOW_NAME, frame_to_display_0);
+    imshow(T2_WINDOW_NAME, frame_to_display_1);
+
+    // handle keyboard events
+    int c = waitKey(0);
+    cout << "Pressed: " << c << endl;
+    if (c == 27) {
+      done = true;
+    }
+  }
+
+  // OpenCV capture and display cleanup
+  cout << "Stopping capture and closing out all windows..." << endl;
+  cam.release();
+  destroyAllWindows();
+
+  // join all threads
+  controller_.join();
+  t1.join();
+  t2.join();
 }
