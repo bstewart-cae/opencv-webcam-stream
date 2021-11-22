@@ -2,6 +2,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <thread>
+#include <chrono>
 #include <queue>
 #include <mutex>
 #include <atomic>
@@ -39,6 +40,25 @@ public:
       lock.unlock();
       cond_.notify_one();
       return size;
+    }
+
+    bool is_accessible() {
+      bool locked = mutex_.try_lock();
+      mutex_.unlock();
+      cond_.notify_one();
+      return locked;
+    }
+
+    unique_lock<mutex> reserve() {
+      unique_lock<mutex> lock(mutex_);
+      cond_.notify_one();
+      return lock;
+    }
+
+    bool relinquish(unique_lock<mutex> &lock_) {
+      lock_.unlock();
+      cond_.notify_one();
+      return is_accessible();
     }
 
     /**
@@ -147,8 +167,7 @@ void rotate_image(const Mat &frame, Mat &output, double angle) {
 
 /* END Overhead dependencies and utilities */
 
-void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done,
-                          const string &windowName) {
+void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done) {
   Mat new_frame, grayscale_frame;
   unsigned int num_frames_pushed = 0;
   double image_angle = 0;
@@ -163,8 +182,6 @@ void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
       frame_queue.pop();
       continue;
     }
-
-//    imwrite("/Users/spencer/Desktop/t1_frame_" + to_string(num_frames_pushed + 1) + ".png", new_frame);
 
     num_frames_pushed++;
 
@@ -189,12 +206,13 @@ void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
   }
 }
 
-void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done,
-                          const string &windowName) {
+void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done) {
   Mat hsv_frame, grayscale_frame, bgr_frame, mirrored, left_half, hist;
 
   while (!done) {
     // check if the queue has 1 frame to process
+    auto top = chrono::steady_clock::now();
+
     unsigned long queue_size = frame_queue.size();
     if (queue_size != 1) {
       if (queue_size > 1) {
@@ -205,36 +223,35 @@ void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
       continue;
     }
 
+    // hold lock on queue while processing around queue specific operations even
+    unique_lock<mutex> queue_lock = frame_queue.reserve();
+
     // peek and grab current (oldest) frame in queue (the only at this point), but don't remove it yet
     hsv_frame = frame_queue.front();
 
-    int vbins = 32;
+    int vbins = 16;
     int histSize[] = {vbins};
 
     float vranges[] = {0, 256};
     const float *ranges[] = {vranges};
 
-    int channels[] = {2};
+    int channels[] = {0};
 
-    left_half = hsv_frame(Rect(0, 0, hsv_frame.cols / 2, hsv_frame.rows));
+    // extract pure grayscale from HSV
+    hsv2gray(hsv_frame, grayscale_frame);
 
+    left_half = grayscale_frame(Rect(0, 0, grayscale_frame.cols / 2, grayscale_frame.rows));
+
+    // compute grayscale histogram
     calcHist(&left_half, 1, channels, Mat(), hist, 1, histSize, ranges, true, false);
+
+    // normalize histogram values
+    normalize(hist, hist, 0, 512, NORM_MINMAX, -1, Mat());
 
     Scalar tempVal = mean(hist);
 
-    float sum_of_bin_medians = 0;
-    float total_freq = 0;
-    int step_size = int (vranges[1] - 1) / histSize[0];
-    for (int i=0; i<histSize[0]; i++) {
-      float freq = hist.at<float>(i, 0);
-      float midpoint = float ((i+1) * step_size - i * step_size) / 2;
-      total_freq += freq;
-      sum_of_bin_medians += midpoint * freq;
-    }
-
     // take the mean of all histogram values, divide that by the number of bins, and then by the histogram step size
-    auto mean_pixel_intensity = sum_of_bin_medians / total_freq;
-    cout << "Mean pixel intensity: " << mean_pixel_intensity << endl;
+    auto mean_pixel_intensity = float(tempVal[0]);
 
     // get original image
     hsv2bgr(hsv_frame, bgr_frame);
@@ -254,6 +271,14 @@ void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
       // queue display of original frame
       display_queue.enqueue(bgr_frame);
     }
+
+    // relinquish a lock hold since all processing of previous frame is done
+    frame_queue.relinquish(queue_lock);
+
+    auto ms = chrono::duration_cast<chrono::milliseconds>(chrono::steady_clock::now() - top).count();
+
+    // sleep until second is up since last processing began
+    this_thread::sleep_for(chrono::milliseconds(1000 - ms));
   }
 }
 
@@ -276,39 +301,27 @@ void controller(VideoCapture &cam, atomic<bool> &done, ThreadSafeQueue<Mat> &fra
     // get new frame
     cam >> frame;
 
+    // if empty frame was pulled, skip it
+    if (frame.empty())
+      continue;
+
     // convert BGR frame to HSV
     bgr2hsv(frame, hsv_frame);
 
-//    imwrite("/Users/spencer/Desktop/frame_" + to_string(frame_idx) + ".png", frame);
-
     // For t1:
     // since frame index is zero-based, push every 2nd frame to t1 by checking for an odd index
-    if (frame_idx % 2 != 0) {
+    if (frame_idx % 2 != 0)
       frame_queue_0.enqueue(hsv_frame);
-      t1_take = true;
-    } else {
-      t1_take = false;
-    }
 
     // For t2:
-    // push frame to t2 via 'frame_queue_1' only as close to every 1 second as possible
-    // ONLY push frame once queue is empty but use size() method since empty/pop conflict is inevitable
-    // and this needs to be a non-blocking check
-    if (frame_queue_1.size() == 0) {
-      // conditionally use copy of HSV frame to avoid concurrent memory access/manipulation
-      if (t1_take) {
-        Mat hsv_frame_copy = hsv_frame.clone();
-        frame_queue_1.enqueue(hsv_frame_copy);
-      } else {
-        frame_queue_1.enqueue(hsv_frame);
-      }
-    }
+    // push frame to t2 via 'frame_queue_1' effectively only as close to every 1 second as possible
+    if (frame_queue_1.is_accessible() && frame_queue_1.size() == 0)
+      frame_queue_1.enqueue(hsv_frame);
 
     // increment frame index
     frame_idx++;
   }
 }
-
 
 int main() {
   VideoCapture cam(0);
@@ -332,8 +345,8 @@ int main() {
 
   std::thread controller_(controller, ref(cam), ref(done), ref(frame_queue_0), ref(frame_queue_1));
 
-  std::thread t1(process_frame_mode_0, ref(frame_queue_0), ref(display_queue_0), ref(done), T1_WINDOW_NAME);
-  std::thread t2(process_frame_mode_1, ref(frame_queue_1), ref(display_queue_1), ref(done), T2_WINDOW_NAME);
+  std::thread t1(process_frame_mode_0, ref(frame_queue_0), ref(display_queue_0), ref(done));
+  std::thread t2(process_frame_mode_1, ref(frame_queue_1), ref(display_queue_1), ref(done));
 
   Mat frame_to_display_0, frame_to_display_1;
 
@@ -347,8 +360,7 @@ int main() {
     imshow(T2_WINDOW_NAME, frame_to_display_1);
 
     // handle keyboard events
-    int c = waitKey(0);
-    cout << "Pressed: " << c << endl;
+    int c = waitKey(1);
     if (c == 27) {
       done = true;
     }
