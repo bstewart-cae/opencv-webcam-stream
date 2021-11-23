@@ -11,8 +11,9 @@ using namespace cv;
 using namespace std;
 using namespace std::chrono_literals;
 
-const string T1_WINDOW_NAME = "t1 window";
-const string T2_WINDOW_NAME = "t2 window";
+static atomic<bool> done = ATOMIC_FLAG_INIT;
+static const string T1_WINDOW_NAME = "t1 window";
+static const string T2_WINDOW_NAME = "t2 window";
 
 /* START Overhead dependencies and utilities */
 /**
@@ -172,7 +173,7 @@ void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
   unsigned int num_frames_pushed = 0;
   double image_angle = 0;
 
-  while (!done) {
+  while (!done.load(memory_order_relaxed)) {
     // check if the queue is as full as we want it (10 frames)
     if (frame_queue.size() < 10) {
       // remove and grab frame reference off of the queue
@@ -209,7 +210,7 @@ void process_frame_mode_0(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat
 void process_frame_mode_1(ThreadSafeQueue<Mat> &frame_queue, ThreadSafeQueue<Mat> &display_queue, atomic<bool> &done) {
   Mat hsv_frame, grayscale_frame, bgr_frame, mirrored, left_half, hist;
 
-  while (!done) {
+  while (!done.load(memory_order_relaxed)) {
     // check if the queue has 1 frame to process
     auto top = chrono::steady_clock::now();
 
@@ -295,7 +296,7 @@ void controller(VideoCapture &cam, atomic<bool> &done, ThreadSafeQueue<Mat> &fra
 
   unsigned int frame_idx = 0;
 
-  while (!done) {
+  while (!done.load(memory_order_relaxed)) {
     // get new frame
     cam >> frame;
 
@@ -335,7 +336,7 @@ int main() {
   ThreadSafeQueue<Mat> display_queue_0, display_queue_1;
 
   // define atomic flag to indicate key press to stop capture, frame feeding and displaying
-  atomic<bool> done(false);
+  done.store(false);
 
   // initialize named windows for t1 and t2 outputs
   namedWindow(T1_WINDOW_NAME, WINDOW_AUTOSIZE);
@@ -348,7 +349,7 @@ int main() {
 
   Mat frame_to_display_0, frame_to_display_1;
 
-  while (!done) {
+  while (!done.load(memory_order_relaxed)) {
     // handle window display updates
     frame_to_display_0 = display_queue_0.dequeue();
     frame_to_display_1 = display_queue_1.dequeue();
@@ -359,21 +360,22 @@ int main() {
 
     // handle keyboard events
     int c = waitKey(1);
-    if (c == 27) {
-      done = true;
-      break;
-    }
+    if (c == 27)
+      done.store(true, memory_order_relaxed);
   }
 
-  // OpenCV capture and display cleanup
-  cout << "Stopping capture and closing out all windows..." << endl;
-  cam.release();
-  destroyAllWindows();
-
-  cout << controller_.joinable() << " | " << t1.joinable() << " | " << t2.joinable() << endl;
-
-  // join all threads
+  // join all threads which should have terminated because atomic flag updates
+  cout << "Joining threads..." << endl;
   controller_.join();
+
+  // once controller thread exits, cam object can be safely interacted with
+  cam.release();
+
   t1.join();
   t2.join();
+
+  // OpenCV capture (invalidating capture object reference that '_controller' was using) and display window cleanup
+  cout << "Stopping capture and closing out all windows..." << endl;
+  destroyWindow(T1_WINDOW_NAME);
+  destroyWindow(T2_WINDOW_NAME);
 }
